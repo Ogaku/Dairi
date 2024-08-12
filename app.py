@@ -1,17 +1,20 @@
 from flask import Flask, jsonify, redirect
 from flask import request
+from flask_cors import CORS, cross_origin
 import threading
 import time
 import requests
 
 app = Flask(__name__)
+cors = CORS(app, support_credentials=True)
+app.config['CORS_HEADERS'] = 'Content-Type'
 
-@app.route('/', methods=['GET'])
-def hello():
-    return redirect("https://youtu.be/3BFTio5296w", code=302)
-
-@app.route('/', methods=['POST'])
+@app.route("/", methods=["GET", "POST", "OPTIONS"])
+@cross_origin(supports_credentials=True)
 def proxy():
+    if request.method == "GET":
+        return redirect("https://youtu.be/3BFTio5296w", code=302)
+
     data = request.get_json()
 
     if not data:
