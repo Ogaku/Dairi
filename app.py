@@ -3,8 +3,10 @@ import html as html_module
 from html.parser import HTMLParser
 import json
 import re
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+import urllib.parse
+from urllib.parse import urlparse, quote
 import requests
 
 _eduvulcan_sessions = {}
@@ -41,62 +43,98 @@ class WSFedFormParser(HTMLParser):
             self.fields[d['name']] = d.get('value', '')
 
 
-def follow_wsfed_sso(session: requests.Session, start_url: str):
-    r = session.get(start_url, allow_redirects=True, timeout=20)
-    print(f"[sso] start {start_url} -> {r.status_code} url={r.url}", flush=True)
-    for step in range(8):
-        if r.status_code == 200 and ('<form' in r.text.lower() and ('wresult' in r.text.lower() or 'wa' in r.text.lower())):
-            parser = WSFedFormParser()
-            parser.feed(r.text)
-            if not parser.action:
-                print("[sso] No form action found", flush=True)
-                break
-            action = html_module.unescape(parser.action)
-            form_data = {k: html_module.unescape(v) for k, v in parser.fields.items()}
-            print(f"[sso] step {step}: POST to {action} with fields {list(form_data.keys())}", flush=True)
-            for k, v in form_data.items():
-                print(f"[sso] field {k}: len={len(v)} preview={v[:60]!r}", flush=True)
-            r = session.post(action, data=form_data, allow_redirects=True, timeout=20)
-            print(f"[sso] step {step} result: {r.status_code} url={r.url} body_len={len(r.text)}", flush=True)
-        else:
-            print(f"[sso] loop break: status={r.status_code} has_form={'<form' in r.text.lower()}", flush=True)
+_prometheus_tokens = {}
+
+
+def submit_form_if_present(session, resp):
+    curr = resp
+    for step in range(5):
+        if not curr or '<form' not in curr.text.lower():
             break
-    return r
+        parser = WSFedFormParser()
+        parser.feed(curr.text)
+        action_raw = parser.action or curr.url
+        action = urllib.parse.urljoin(curr.url, html_module.unescape(action_raw))
+        form_data = {k: html_module.unescape(v) for k, v in parser.fields.items()}
+        print(f"[sso] (step {step+1}) submit_form to {action} with fields {list(form_data.keys())}", flush=True)
+        headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': curr.url,
+            'Origin': f"{urlparse(curr.url).scheme}://{urlparse(curr.url).netloc}",
+            'Upgrade-Insecure-Requests': '1',
+        }
+        curr = session.post(action, data=form_data, headers=headers, timeout=25, allow_redirects=True)
+        print(f"[sso] (step {step+1}) submitted -> {curr.status_code} {curr.url} (body_len={len(curr.text)})", flush=True)
+    return curr
 
 
-def ensure_wiadomosci_sso(session: requests.Session, partition: str):
-    if not partition:
-        return False
-    session.headers.update({
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': f'https://wiadomosci.eduvulcan.pl/{partition}/App/odebrane',
-    })
-    test_url = f"https://wiadomosci.eduvulcan.pl/{partition}/api/Odebrane?idLastWiadomosc=0&pageSize=1"
-    try:
-        r = session.get(test_url, timeout=10, allow_redirects=False)
-        if r.status_code == 200:
-            return True
-    except Exception:
-        pass
+def authorize_prometheus(session, url):
+    html_headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Upgrade-Insecure-Requests': '1',
+    }
+    r1 = session.get(url, headers=html_headers, timeout=25, allow_redirects=True)
+    print(f"[sso] authorize GET {url[:100]}... -> {r1.status_code} {r1.url}", flush=True)
+    return submit_form_if_present(session, r1)
 
-    start_url = f"https://wiadomosci.eduvulcan.pl/{partition}/Account/Login"
-    follow_wsfed_sso(session, start_url)
 
-    try:
-        app_url = f"https://wiadomosci.eduvulcan.pl/{partition}/App/odebrane"
-        r_app = session.get(app_url, timeout=15, allow_redirects=True)
-        print(f"[sso] visited {app_url} -> {r_app.status_code} url={r_app.url}", flush=True)
-    except Exception as e:
-        print(f"[sso] app visit error: {e}", flush=True)
+def ensure_prometheus_messages_session(session: requests.Session, tenant: str):
+    if not tenant:
+        return None
 
-    try:
-        r = session.get(test_url, timeout=10, allow_redirects=False)
-        sample_b = r.text[:200].encode('ascii', errors='backslashreplace').decode('ascii')
-        print(f"[sso] final test_url {test_url} -> {r.status_code} body={sample_b!r}", flush=True)
-        return r.status_code == 200
-    except Exception as e:
-        print(f"[sso] final test error: {e}", flush=True)
-        return False
+    # Step 1: Distribute cookies across all relevant domains (as in Szpontniczek)
+    for c in list(session.cookies):
+        for d in ['eduvulcan.pl', 'dziennik-logowanie.vulcan.net.pl', 'wiadomosci.eduvulcan.pl', 'uczen.eduvulcan.pl']:
+            session.cookies.set(c.name, c.value, domain=d, path='/')
+
+    cached = _prometheus_tokens.get(tenant)
+    if cached and cached.get('appGuid') and cached.get('antiForgeryToken'):
+        return cached
+
+    sso_base = "https://dziennik-logowanie.vulcan.net.pl"
+    messages_base = "https://wiadomosci.eduvulcan.pl"
+    prometheus_encoded = urllib.parse.quote("https://eduvulcan.pl", safe="")
+    sso_encoded = urllib.parse.quote(sso_base, safe="")
+    student_encoded = urllib.parse.quote("https://uczen.eduvulcan.pl", safe="")
+
+    # Flow 1: Authenticate client in the SSO domain via uczen.eduvulcan.pl
+    first_auth_url = (
+        f"https://eduvulcan.pl/fs/ls?wa=wsignin1.0&wtrealm={sso_encoded}%2F{tenant}%2FFs%2FLs"
+        f"%3Fwa%3Dwsignin1.0%26wtrealm%3D{student_encoded}%2F{tenant}%2FAccount%2FLogin"
+        f"%3FreturnUrl%3D{prometheus_encoded}%26wctx%3Dauth%3DstudentEV%26nslo%3D1&wctx=nslo%3D1"
+    )
+    print(f"[sso] Prometheus Flow 1: firstAuthUrl for tenant={tenant}", flush=True)
+    authorize_prometheus(session, first_auth_url)
+
+    # Flow 2: Authenticate client in the messages domain
+    authorize_url = (
+        f"{sso_base}/{tenant}/Fs/Ls?wa=wsignin1.0&wtrealm={messages_base}/{tenant}/Account/Login"
+        f"?returnUrl=/{tenant}/App&wctx=auth=studentEV&nslo=1"
+    )
+    print(f"[sso] Prometheus Flow 2: authorizeUrl for tenant={tenant}", flush=True)
+    authorize_prometheus(session, authorize_url)
+
+    # Step 4: Fetch tokens from App
+    app_url = f"{messages_base}/{tenant}/App"
+    print(f"[sso] Fetching tokens from {app_url}", flush=True)
+    r_app = session.get(app_url, timeout=20, allow_redirects=True)
+    if '<form' in r_app.text.lower():
+        r_app = submit_form_if_present(session, r_app)
+    anti_m = re.search(r"""antiForgeryToken:\s*['"]([^'"]+)['"]""", r_app.text)
+    guid_m = re.search(r"""appGuid:\s*['"]([^'"]+)['"]""", r_app.text)
+    anti_forgery_token = anti_m.group(1) if anti_m else ""
+    app_guid = guid_m.group(1) if guid_m else ""
+
+    print(f"[sso] Extracted antiForgeryToken={'OK' if anti_forgery_token else 'EMPTY'}, appGuid={'OK' if app_guid else 'EMPTY'}", flush=True)
+    if not (anti_forgery_token and app_guid):
+        print(f"[sso] Failed to extract tokens! status={r_app.status_code} url={r_app.url} sample={r_app.text[:300]!r}", flush=True)
+
+    if anti_forgery_token and app_guid:
+        res = {'appGuid': app_guid, 'antiForgeryToken': anti_forgery_token}
+        _prometheus_tokens[tenant] = res
+        return res
+    return None
 
 
 def handle_eduvulcan_login(login: str, password: str):
@@ -226,52 +264,100 @@ def handle_proxy_request(data):
                 print(f"[proxy] Error: No active session for {login!r}", flush=True)
                 return {"error": "Brak aktywnej sesji eduVULCAN w proxy"}, 401
 
-        ok = ensure_wiadomosci_sso(s, partition)
-        print(f"[proxy] ensure_wiadomosci_sso for {partition} -> {ok}", flush=True)
+        mailbox_key = data.get('mailboxKey') or data.get('boxKey')
+        print(f"[proxy] eduvulcan_fetch_messages: login={login!r}, partition={partition!r}, folder={folder!r}, mailboxKey={mailbox_key!r}", flush=True)
 
-        url = f"https://wiadomosci.eduvulcan.pl/{partition}/api/{folder}?idLastWiadomosc={id_last}&pageSize={page_size}"
-        r = s.get(url, timeout=15)
         try:
-            return {"status": 200, "data": r.json()}, 200
-        except Exception:
-            return {"status": r.status_code, "data": {"text": r.text}}, r.status_code
+            tokens = ensure_prometheus_messages_session(s, partition)
+            if not tokens:
+                print(f"[proxy] Error: Failed to obtain Prometheus messages tokens for {partition}", flush=True)
+                return {"error": "Nie udalo sie pobrac tokenow do wiadomosci (Prometheus SSO)"}, 500
+
+            api_headers = {
+                'X-V-AppGuid': tokens['appGuid'],
+                'X-V-RequestVerificationToken': tokens['antiForgeryToken'],
+                'Content-Type': 'application/json',
+                'Accept': 'application/json, text/plain, */*',
+                'Referer': f"https://wiadomosci.eduvulcan.pl/{partition}/App",
+            }
+
+            # If mailbox_key was not provided, fetch /api/Skrzynki to discover it
+            if not mailbox_key:
+                try:
+                    r_boxes = s.get(f"https://wiadomosci.eduvulcan.pl/{partition}/api/Skrzynki", headers=api_headers, timeout=15)
+                    boxes = r_boxes.json()
+                    print(f"[proxy] /api/Skrzynki returned: {boxes}", flush=True)
+                    if isinstance(boxes, list) and boxes:
+                        mailbox_key = boxes[0].get('globalKey')
+                except Exception as e:
+                    print(f"[proxy] Failed to fetch /api/Skrzynki: {e}", flush=True)
+
+            if folder.lower() in ('wyslane', 'sent'):
+                endpoint = '/api/WyslaneSkrzynka'
+            elif folder.lower() in ('usuniete', 'deleted'):
+                endpoint = '/api/UsunieteSkrzynka'
+            else:
+                endpoint = '/api/OdebraneSkrzynka'
+
+            url = f"https://wiadomosci.eduvulcan.pl/{partition}{endpoint}"
+            params = {
+                'idLastWiadomosc': id_last,
+                'pageSize': page_size,
+            }
+            if mailbox_key:
+                params['globalKeySkrzynka'] = mailbox_key
+
+            r = s.get(url, params=params, headers=api_headers, timeout=15)
+            print(f"[proxy] {endpoint} status={r.status_code} body_len={len(r.text)}", flush=True)
+            try:
+                return {"status": 200, "data": r.json()}, 200
+            except Exception:
+                return {"status": r.status_code, "data": {"text": r.text}}, r.status_code
+        except Exception as e:
+            print(f"[proxy] Exception in eduvulcan_fetch_messages: {e}", flush=True)
+            traceback.print_exc()
+            return {"error": str(e)}, 500
 
     if action == 'eduvulcan_fetch_message_content':
-        login = str(data.get('login', ''))
-        partition = str(data.get('partition', ''))
-        msg_id = data.get('id')
-        global_key = data.get('apiGlobalKey')
+        try:
+            login = str(data.get('login', ''))
+            partition = str(data.get('partition', ''))
+            msg_id = data.get('id')
+            global_key = data.get('apiGlobalKey')
 
-        s = _eduvulcan_sessions.get(login)
-        if not s and 'password' in data and data['password']:
-            handle_eduvulcan_login(login, str(data['password']))
             s = _eduvulcan_sessions.get(login)
+            if not s and 'password' in data and data['password']:
+                handle_eduvulcan_login(login, str(data['password']))
+                s = _eduvulcan_sessions.get(login)
 
-        if not s:
-            if len(_eduvulcan_sessions) == 1:
-                s = next(iter(_eduvulcan_sessions.values()))
-            else:
-                return {"error": "Brak aktywnej sesji eduVULCAN w proxy"}, 401
+            if not s:
+                if len(_eduvulcan_sessions) == 1:
+                    s = next(iter(_eduvulcan_sessions.values()))
+                else:
+                    return {"error": "Brak aktywnej sesji eduVULCAN w proxy"}, 401
 
-        ensure_wiadomosci_sso(s, partition)
-        urls_to_try = [
-            f"https://wiadomosci.eduvulcan.pl/{partition}/api/WiadomoscSzczegoly?id={msg_id}",
-            f"https://wiadomosci.eduvulcan.pl/{partition}/api/Wiadomosc?id={msg_id}",
-            f"https://wiadomosci.eduvulcan.pl/{partition}/api/WiadomoscSzczegoly?apiGlobalKey={global_key}",
-            f"https://wiadomosci.eduvulcan.pl/{partition}/api/Wiadomosc?apiGlobalKey={global_key}",
-        ]
-        for url in urls_to_try:
-            if msg_id is None and 'id=' in url:
-                continue
-            if not global_key and 'apiGlobalKey=' in url:
-                continue
-            r = s.get(url, timeout=15)
-            if r.status_code == 200:
-                try:
-                    return {"status": 200, "data": r.json()}, 200
-                except Exception:
-                    pass
-        return {"status": 404, "error": "Nie znaleziono tresci wiadomosci"}, 404
+            tokens = ensure_prometheus_messages_session(s, partition)
+            if not tokens:
+                return {"error": "Nie udalo sie pobrac tokenow do wiadomosci"}, 500
+
+            api_headers = {
+                'X-V-AppGuid': tokens['appGuid'],
+                'X-V-RequestVerificationToken': tokens['antiForgeryToken'],
+                'Content-Type': 'application/json',
+                'Accept': 'application/json, text/plain, */*',
+                'Referer': f"https://wiadomosci.eduvulcan.pl/{partition}/App",
+            }
+
+            url = f"https://wiadomosci.eduvulcan.pl/{partition}/api/WiadomoscSzczegoly"
+            r = s.get(url, params={'apiGlobalKey': global_key or msg_id}, headers=api_headers, timeout=15)
+            try:
+                return {"status": 200, "data": r.json()}, 200
+            except Exception:
+                return {"status": r.status_code, "data": {"text": r.text}}, r.status_code
+        except Exception as e:
+            print(f"[proxy] Exception in eduvulcan_fetch_message_content: {e}", flush=True)
+            traceback.print_exc()
+            return {"error": str(e)}, 500
 
     url = data.get('uri')
     if not url:
