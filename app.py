@@ -96,11 +96,6 @@ def ensure_prometheus_messages_session(session: requests.Session, tenant: str):
     if cached and cached.get('appGuid') and cached.get('antiForgeryToken'):
         return cached
 
-    # Clean up any oversized SSO cookies from wiadomosci domain so header size stays minimal
-    for c in list(session.cookies):
-        if 'wiadomosci' in c.domain and ('Efeb' in c.name or len(c.value) > 1000):
-            session.cookies.clear(c.domain, c.path, c.name)
-
     sso_base = "https://dziennik-logowanie.vulcan.net.pl"
     messages_base = "https://wiadomosci.eduvulcan.pl"
     prometheus_encoded = urllib.parse.quote("https://eduvulcan.pl", safe="")
@@ -321,18 +316,33 @@ def handle_proxy_request(data):
             if mailbox_key:
                 params['globalKeySkrzynka'] = mailbox_key
 
-            for c in list(s.cookies):
-                if 'wiadomosci' in c.domain and ('Efeb' in c.name or len(c.value) > 1000):
-                    s.cookies.clear(c.domain, c.path, c.name)
-
             r = s.get(url, params=params, headers=api_headers, timeout=15)
             print(f"[proxy] {endpoint} status={r.status_code} body_len={len(r.text)}", flush=True)
-            if r.status_code in (401, 403):
-                _prometheus_tokens.pop(partition, None)
+
+            r_json = None
             try:
-                return {"status": 200, "data": r.json()}, 200
+                r_json = r.json()
             except Exception:
-                return {"status": r.status_code, "data": {"text": r.text}}, r.status_code
+                pass
+
+            is_error = (r.status_code in (401, 403, 409)) or (isinstance(r_json, dict) and ('message' in r_json or 'error' in r_json))
+            if is_error:
+                print(f"[proxy] {endpoint} unauthorized/error ({r.status_code}: {r_json}), re-authenticating SSO for {partition}...", flush=True)
+                _prometheus_tokens.pop(partition, None)
+                tokens = ensure_prometheus_messages_session(s, partition)
+                if tokens:
+                    api_headers['X-V-AppGuid'] = tokens['appGuid']
+                    api_headers['X-V-RequestVerificationToken'] = tokens['antiForgeryToken']
+                    r = s.get(url, params=params, headers=api_headers, timeout=15)
+                    print(f"[proxy] {endpoint} retry status={r.status_code} body_len={len(r.text)}", flush=True)
+                    try:
+                        r_json = r.json()
+                    except Exception:
+                        pass
+
+            if r.status_code == 200 and isinstance(r_json, (list, dict)):
+                return {"status": 200, "data": r_json}, 200
+            return {"status": r.status_code, "data": r_json or r.text}, (r.status_code if r.status_code != 200 else 401)
         except Exception as e:
             print(f"[proxy] Exception in eduvulcan_fetch_messages: {e}", flush=True)
             traceback.print_exc()
@@ -369,17 +379,33 @@ def handle_proxy_request(data):
             }
 
             url = f"https://wiadomosci.eduvulcan.pl/{partition}/api/WiadomoscSzczegoly"
-            for c in list(s.cookies):
-                if 'wiadomosci' in c.domain and ('Efeb' in c.name or len(c.value) > 1000):
-                    s.cookies.clear(c.domain, c.path, c.name)
             r = s.get(url, params={'apiGlobalKey': global_key or msg_id}, headers=api_headers, timeout=15)
             print(f"[proxy] /api/WiadomoscSzczegoly status={r.status_code} body_len={len(r.text)}", flush=True)
-            if r.status_code in (401, 403):
-                _prometheus_tokens.pop(partition, None)
+
+            r_json = None
             try:
-                return {"status": 200, "data": r.json()}, 200
+                r_json = r.json()
             except Exception:
-                return {"status": r.status_code, "data": {"text": r.text}}, r.status_code
+                pass
+
+            is_error = (r.status_code in (401, 403, 409)) or (isinstance(r_json, dict) and ('message' in r_json or 'error' in r_json))
+            if is_error:
+                print(f"[proxy] /api/WiadomoscSzczegoly unauthorized/error ({r.status_code}: {r_json}), re-authenticating SSO for {partition}...", flush=True)
+                _prometheus_tokens.pop(partition, None)
+                tokens = ensure_prometheus_messages_session(s, partition)
+                if tokens:
+                    api_headers['X-V-AppGuid'] = tokens['appGuid']
+                    api_headers['X-V-RequestVerificationToken'] = tokens['antiForgeryToken']
+                    r = s.get(url, params={'apiGlobalKey': global_key or msg_id}, headers=api_headers, timeout=15)
+                    print(f"[proxy] /api/WiadomoscSzczegoly retry status={r.status_code} body_len={len(r.text)}", flush=True)
+                    try:
+                        r_json = r.json()
+                    except Exception:
+                        pass
+
+            if r.status_code == 200 and isinstance(r_json, dict):
+                return {"status": 200, "data": r_json}, 200
+            return {"status": r.status_code, "data": r_json or r.text}, (r.status_code if r.status_code != 200 else 401)
         except Exception as e:
             print(f"[proxy] Exception in eduvulcan_fetch_message_content: {e}", flush=True)
             traceback.print_exc()
