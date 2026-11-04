@@ -3,11 +3,19 @@ import html as html_module
 from html.parser import HTMLParser
 import json
 import re
+import sys
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
 from urllib.parse import urlparse, quote
 import requests
+
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 _eduvulcan_sessions = {}
 
@@ -46,37 +54,38 @@ class WSFedFormParser(HTMLParser):
 _prometheus_tokens = {}
 
 
-def submit_form_if_present(session, resp):
+def submit_form_if_present(session, resp, label="sso"):
     curr = resp
     for step in range(5):
-        if not curr or '<form' not in curr.text.lower():
+        if not curr:
+            print(f"[{label}] (step {step+1}) curr is None", flush=True)
+            break
+        try:
+            with open(f"A:\\Documents\\repos\\Dairi\\debug_{label}_step_{step}.html", "w", encoding="utf-8") as f:
+                f.write(f"<!-- URL: {curr.url} STATUS: {curr.status_code} -->\n" + curr.text)
+        except Exception:
+            pass
+        if '<form' not in curr.text.lower():
+            print(f"[{label}] (step {step+1}) No '<form' in body. status={curr.status_code} url={curr.url} (body_len={len(curr.text)})", flush=True)
             break
         parser = WSFedFormParser()
         parser.feed(curr.text)
-        action_raw = parser.action or curr.url
-        action = urllib.parse.urljoin(curr.url, html_module.unescape(action_raw))
-        form_data = {k: html_module.unescape(v) for k, v in parser.fields.items()}
-        print(f"[sso] (step {step+1}) submit_form to {action} with fields {list(form_data.keys())}", flush=True)
-        headers = {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': curr.url,
-            'Origin': f"{urlparse(curr.url).scheme}://{urlparse(curr.url).netloc}",
-            'Upgrade-Insecure-Requests': '1',
-        }
-        curr = session.post(action, data=form_data, headers=headers, timeout=25, allow_redirects=True)
-        print(f"[sso] (step {step+1}) submitted -> {curr.status_code} {curr.url} (body_len={len(curr.text)})", flush=True)
+        action = urllib.parse.urljoin(curr.url, parser.action or curr.url)
+        form_data = parser.fields
+        print(f"[{label}] (step {step+1}) submit_form to {action} with fields {list(form_data.keys())}", flush=True)
+        curr = session.post(action, data=form_data, timeout=25, allow_redirects=True)
+        print(f"[{label}] (step {step+1}) submitted -> {curr.status_code} {curr.url} (body_len={len(curr.text)})", flush=True)
     return curr
 
 
-def authorize_prometheus(session, url):
+def authorize_prometheus(session, url, label="flow"):
     html_headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Upgrade-Insecure-Requests': '1',
     }
     r1 = session.get(url, headers=html_headers, timeout=25, allow_redirects=True)
-    print(f"[sso] authorize GET {url[:100]}... -> {r1.status_code} {r1.url}", flush=True)
-    return submit_form_if_present(session, r1)
+    print(f"[{label}] authorize GET {url[:100]}... -> {r1.status_code} {r1.url}", flush=True)
+    return submit_form_if_present(session, r1, label=label)
 
 
 def ensure_prometheus_messages_session(session: requests.Session, tenant: str):
@@ -105,7 +114,7 @@ def ensure_prometheus_messages_session(session: requests.Session, tenant: str):
         f"%3FreturnUrl%3D{prometheus_encoded}%26wctx%3Dauth%3DstudentEV%26nslo%3D1&wctx=nslo%3D1"
     )
     print(f"[sso] Prometheus Flow 1: firstAuthUrl for tenant={tenant}", flush=True)
-    authorize_prometheus(session, first_auth_url)
+    authorize_prometheus(session, first_auth_url, label="flow1")
 
     # Flow 2: Authenticate client in the messages domain
     authorize_url = (
@@ -113,14 +122,19 @@ def ensure_prometheus_messages_session(session: requests.Session, tenant: str):
         f"?returnUrl=/{tenant}/App&wctx=auth=studentEV&nslo=1"
     )
     print(f"[sso] Prometheus Flow 2: authorizeUrl for tenant={tenant}", flush=True)
-    authorize_prometheus(session, authorize_url)
+    authorize_prometheus(session, authorize_url, label="flow2")
 
     # Step 4: Fetch tokens from App
     app_url = f"{messages_base}/{tenant}/App"
     print(f"[sso] Fetching tokens from {app_url}", flush=True)
     r_app = session.get(app_url, timeout=20, allow_redirects=True)
     if '<form' in r_app.text.lower():
-        r_app = submit_form_if_present(session, r_app)
+        r_app = submit_form_if_present(session, r_app, label="app_auth")
+    try:
+        with open("A:\\Documents\\repos\\Dairi\\debug_app.html", "w", encoding="utf-8") as f:
+            f.write(f"<!-- URL: {r_app.url} STATUS: {r_app.status_code} -->\n" + r_app.text)
+    except Exception:
+        pass
     anti_m = re.search(r"""antiForgeryToken:\s*['"]([^'"]+)['"]""", r_app.text)
     guid_m = re.search(r"""appGuid:\s*['"]([^'"]+)['"]""", r_app.text)
     anti_forgery_token = anti_m.group(1) if anti_m else ""
@@ -128,7 +142,7 @@ def ensure_prometheus_messages_session(session: requests.Session, tenant: str):
 
     print(f"[sso] Extracted antiForgeryToken={'OK' if anti_forgery_token else 'EMPTY'}, appGuid={'OK' if app_guid else 'EMPTY'}", flush=True)
     if not (anti_forgery_token and app_guid):
-        print(f"[sso] Failed to extract tokens! status={r_app.status_code} url={r_app.url} sample={r_app.text[:300]!r}", flush=True)
+        print(f"[sso] Failed to extract tokens! status={r_app.status_code} url={r_app.url} len={len(r_app.text)}", flush=True)
 
     if anti_forgery_token and app_guid:
         res = {'appGuid': app_guid, 'antiForgeryToken': anti_forgery_token}
@@ -309,6 +323,8 @@ def handle_proxy_request(data):
 
             r = s.get(url, params=params, headers=api_headers, timeout=15)
             print(f"[proxy] {endpoint} status={r.status_code} body_len={len(r.text)}", flush=True)
+            if r.status_code in (401, 403):
+                _prometheus_tokens.pop(partition, None)
             try:
                 return {"status": 200, "data": r.json()}, 200
             except Exception:
@@ -350,6 +366,9 @@ def handle_proxy_request(data):
 
             url = f"https://wiadomosci.eduvulcan.pl/{partition}/api/WiadomoscSzczegoly"
             r = s.get(url, params={'apiGlobalKey': global_key or msg_id}, headers=api_headers, timeout=15)
+            print(f"[proxy] /api/WiadomoscSzczegoly status={r.status_code} body_len={len(r.text)}", flush=True)
+            if r.status_code in (401, 403):
+                _prometheus_tokens.pop(partition, None)
             try:
                 return {"status": 200, "data": r.json()}, 200
             except Exception:
