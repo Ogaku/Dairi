@@ -1,4 +1,6 @@
 import hashlib
+import html as html_module
+from html.parser import HTMLParser
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,29 +27,35 @@ def solve_vulcan_pow(challenge: str, difficulty: int, rounds: int) -> str:
     return ";".join(str(x) for x in results)
 
 
+class WSFedFormParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.action = None
+        self.fields = {}
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if tag.lower() == 'form' and self.action is None:
+            self.action = d.get('action')
+        elif tag.lower() == 'input' and 'name' in d:
+            self.fields[d['name']] = d.get('value', '')
+
+
 def follow_wsfed_sso(session: requests.Session, start_url: str):
-    import html as html_module
     r = session.get(start_url, allow_redirects=True, timeout=20)
     print(f"[sso] start {start_url} -> {r.status_code} url={r.url}", flush=True)
-    for step in range(5):
+    for step in range(8):
         if r.status_code == 200 and ('<form' in r.text.lower() and ('wresult' in r.text.lower() or 'wa' in r.text.lower())):
-            print(f"[sso] step {step} page html preview:\n{r.text[:800]}\n---", flush=True)
-            action_m = re.search(r'<form[^>]*action=[\x22\x27]([^\x22\x27]+)[\x22\x27]', r.text, re.IGNORECASE)
-            if not action_m:
+            parser = WSFedFormParser()
+            parser.feed(r.text)
+            if not parser.action:
                 print("[sso] No form action found", flush=True)
                 break
-            action = html_module.unescape(action_m.group(1))
-            form_data = {}
-            for item in re.finditer(r'<input[^>]+>', r.text, re.IGNORECASE):
-                tag = item.group(0)
-                n_m = re.search(r'name=[\x22\x27]([^\x22\x27]+)[\x22\x27]', tag, re.IGNORECASE)
-                v_m = re.search(r'value=[\x22\x27]([\s\S]*?)[\x22\x27]', tag, re.IGNORECASE)
-                if n_m:
-                    val = html_module.unescape(v_m.group(1)) if v_m else ""
-                    form_data[n_m.group(1)] = val
+            action = html_module.unescape(parser.action)
+            form_data = {k: html_module.unescape(v) for k, v in parser.fields.items()}
             print(f"[sso] step {step}: POST to {action} with fields {list(form_data.keys())}", flush=True)
             for k, v in form_data.items():
-                print(f"[sso] field {k}: len={len(v)} preview={v[:100]!r}", flush=True)
+                print(f"[sso] field {k}: len={len(v)} preview={v[:60]!r}", flush=True)
             r = session.post(action, data=form_data, allow_redirects=True, timeout=20)
             print(f"[sso] step {step} result: {r.status_code} url={r.url} body_len={len(r.text)}", flush=True)
         else:
@@ -83,7 +91,8 @@ def ensure_wiadomosci_sso(session: requests.Session, partition: str):
 
     try:
         r = session.get(test_url, timeout=10, allow_redirects=False)
-        print(f"[sso] final test_url {test_url} -> {r.status_code} body={r.text[:200]!r}", flush=True)
+        sample_b = r.text[:200].encode('ascii', errors='backslashreplace').decode('ascii')
+        print(f"[sso] final test_url {test_url} -> {r.status_code} body={sample_b!r}", flush=True)
         return r.status_code == 200
     except Exception as e:
         print(f"[sso] final test error: {e}", flush=True)
